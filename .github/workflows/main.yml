@@ -1,0 +1,219 @@
+name: Build Royal Wedding Hub APK
+
+'on':
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Find website ZIP and create Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip python3-pip
+          python3 -m pip install --user --break-system-packages pillow
+
+          WORK="$RUNNER_TEMP/rwh-build"
+          WEB="$WORK/web"
+          ANDROID="$WORK/android"
+          mkdir -p "$WEB" "$ANDROID/app/src/main/assets/www" \
+            "$ANDROID/app/src/main/java/com/royalweddinghub"
+
+          ZIP_FILE="$(find "$GITHUB_WORKSPACE" -type f -iname '*.zip' \
+            ! -path '*/.git/*' -print -quit || true)"
+
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found website ZIP: $ZIP_FILE"
+            unzip -oq "$ZIP_FILE" -d "$WEB"
+          else
+            echo "No ZIP found; checking repository for website files."
+            cp -a "$GITHUB_WORKSPACE/." "$WEB/"
+          fi
+
+          INDEX_FILE="$(find "$WEB" -type f -name index.html -print -quit || true)"
+          if [ -z "$INDEX_FILE" ]; then
+            echo "::error::No index.html found in the ZIP/repository."
+            find "$WEB" -maxdepth 4 -type f | head -100
+            exit 1
+          fi
+
+          WEB_DIR="$(dirname "$INDEX_FILE")"
+          cp -a "$WEB_DIR/." "$ANDROID/app/src/main/assets/www/"
+
+          # Keep the supplied app icon unchanged; create Android launcher-size copies.
+          ICON_FILE="$WEB_DIR/app-icon.png"
+          if [ ! -f "$ICON_FILE" ]; then
+            ICON_FILE="$WEB_DIR/icon-512.png"
+          fi
+          if [ ! -f "$ICON_FILE" ]; then
+            echo "::error::app-icon.png or icon-512.png was not found."
+            exit 1
+          fi
+
+          python3 - "$ICON_FILE" "$ANDROID/app/src/main/res" <<'PY'
+          import os, sys
+          from PIL import Image
+          source, res = sys.argv[1], sys.argv[2]
+          img = Image.open(source).convert("RGBA")
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+          for folder, size in sizes.items():
+              outdir = os.path.join(res, folder)
+              os.makedirs(outdir, exist_ok=True)
+              img.resize((size, size), Image.Resampling.LANCZOS).save(
+                  os.path.join(outdir, "ic_launcher.png")
+              )
+              img.resize((size, size), Image.Resampling.LANCZOS).save(
+                  os.path.join(outdir, "ic_launcher_round.png")
+              )
+          PY
+
+          cat > "$ANDROID/settings.gradle" <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "RoyalWeddingHub"
+          include(":app")
+          EOF
+
+          cat > "$ANDROID/build.gradle" <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > "$ANDROID/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > "$ANDROID/app/build.gradle" <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.royalweddinghub'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.royalweddinghub'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+          }
+          EOF
+
+          cat > "$ANDROID/app/src/main/AndroidManifest.xml" <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Royal Wedding Hub"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > "$ANDROID/app/src/main/java/com/royalweddinghub/MainActivity.java" <<'EOF'
+          package com.royalweddinghub;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  WebView webView = new WebView(this);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+                  setContentView(webView);
+                  webView.loadUrl("file:///android_asset/www/index.html");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  setContentView(getWindow().getDecorView());
+                  super.onBackPressed();
+              }
+          }
+          EOF
+
+          echo "ANDROID_PROJECT=$ANDROID" >> "$GITHUB_ENV"
+          echo "Created Android project from website files at $ANDROID"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        run: |
+          cd "$ANDROID_PROJECT"
+          gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Royal-Wedding-Hub-APK
+          path: ${{ runner.temp }}/rwh-build/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          
